@@ -1,6 +1,6 @@
 import torch
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 from outlier import OutlierAwareQuantizer, OutlierCompressedKV
 
 @dataclass
@@ -23,14 +23,20 @@ class CompressedKVCache:
         k_bits (float): Số bit trung bình được cấp phát để nén mỗi phần tử của Key.
         v_bits (float): Số bit trung bình được cấp phát để nén mỗi phần tử của Value.
     """
+
+    # K luôn được nén để tiết kiệm băng thông
     k_data: List[List[OutlierCompressedKV]]
-    v_data: List[List[OutlierCompressedKV]]
+
+    # V có thể là dữ liệu nén (ở các layer giữa) hoặc tensor gốc (ở layer biên)
+    v_data: List[List[Union[OutlierCompressedKV, torch.Tensor]]]
+
     num_layers: int
     num_heads: int
     seq_len: int
     head_dim: int
     k_bits: float
     v_bits: float
+    boundary_layers: int  # Số lượng layer biên cần bảo vệ ở mỗi đầu
 
 class KVCacheCompressor:
     """
@@ -48,6 +54,7 @@ class KVCacheCompressor:
         head_dim: int, 
         k_bits: float = 3.5, 
         v_bits: float = 2.5, 
+        boundary_layers: int = 2,  # Thêm cấu hình số layer biên
         device: str | torch.device = 'cpu'
     ):
         """
@@ -66,6 +73,7 @@ class KVCacheCompressor:
         self.head_dim = head_dim
         self.k_bits = k_bits
         self.v_bits = v_bits
+        self.boundary_layers = boundary_layers
         self.device = device
 
         # Khởi tạo các bộ nén độc lập cho Key và Value (Chiến lược bất đối xứng)
@@ -120,6 +128,10 @@ class KVCacheCompressor:
         for l in range(self.num_layers):
             k_layer = []
             v_layer = []
+
+            # Kiểm tra xem layer hiện tại có nằm trong vùng biên không
+            is_boundary = (l < self.boundary_layers) or (l >= self.num_layers - self.boundary_layers)
+
             for h in range(self.num_heads):
                 # Trích xuất toàn bộ các vector thuộc một cơ chế chú ý (Head) cụ thể.
                 # Shape đầu vào tại bước này là `[seq_len, head_dim]`.
@@ -127,8 +139,16 @@ class KVCacheCompressor:
                 v_vecs = v_cache[l, h]
                 
                 # Thực hiện lượng tử hóa (bảo vệ ngoại lai + nén vô hướng)
+                # Key luôn được nén (Sử dụng mức bit cao như 3.5 để bảo vệ Attention)
                 k_layer.append(self.k_quantizer.quantize(k_vecs))
-                v_layer.append(self.v_quantizer.quantize(v_vecs))
+                
+                # Value áp dụng Boundary V: Giữ nguyên tensor gốc nếu là layer biên
+                if is_boundary:
+                    # Lưu tensor Float16/Float32 gốc để bảo toàn độ chính xác tuyệt đối
+                    v_layer.append(v_vecs.clone())
+                else:
+                    # Nén sâu (VD: 2.5 bit hoặc 2.0 bit) cho các layer ở giữa
+                    v_layer.append(self.v_quantizer.quantize(v_vecs))
                 
             k_compressed_all.append(k_layer)
             v_compressed_all.append(v_layer)
@@ -138,7 +158,8 @@ class KVCacheCompressor:
             k_data=k_compressed_all, v_data=v_compressed_all,
             num_layers=self.num_layers, num_heads=self.num_heads,
             seq_len=seq_len, head_dim=self.head_dim,
-            k_bits=self.k_bits, v_bits=self.v_bits
+            k_bits=self.k_bits, v_bits=self.v_bits,
+            boundary_layers=self.boundary_layers
         )
 
     def decompress(self, compressed: CompressedKVCache) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -160,10 +181,18 @@ class KVCacheCompressor:
 
         # Khôi phục dữ liệu theo từng Layer và từng Head
         for l in range(compressed.num_layers):
+            is_boundary = (l < compressed.boundary_layers) or (l >= compressed.num_layers - compressed.boundary_layers)
+
             for h in range(compressed.num_heads):
                 # Giải lượng tử hóa lấy lại giá trị thực (Float16/Float32)
                 k_out[l, h] = self.k_quantizer.dequantize(compressed.k_data[l][h])
-                v_out[l, h] = self.v_quantizer.dequantize(compressed.v_data[l][h])
+
+                # Giải nén phân nhánh dựa trên tính chất của layer
+                if is_boundary:
+                    # Chép trực tiếp tensor gốc vào đầu ra
+                    v_out[l, h] = compressed.v_data[l][h]
+                else:
+                    v_out[l, h] = self.v_quantizer.dequantize(compressed.v_data[l][h])
                 
         return k_out, v_out
 
@@ -181,21 +210,27 @@ class KVCacheCompressor:
             Dict[str, float]: Bảng thống kê bao gồm kích thước gốc (MB), kích thước nén (MB) 
                 và tỷ lệ nén (Compression Ratio).
         """
-        # Tính tổng số lượng vector trong toàn bộ KV Cache
-        total_vectors = self.num_layers * self.num_heads * seq_len
+        # Cập nhật hàm tính toán memory stats để phản ánh đúng dung lượng khi có layer biên
+        total_layers = self.num_layers
+        compressed_layers = max(0, total_layers - 2 * self.boundary_layers)
+        boundary_layers = total_layers - compressed_layers
+
+        total_vectors_per_layer = self.num_heads * seq_len
+        original_bytes_per_layer = total_vectors_per_layer * self.head_dim * 2 * 2 # KV float16
+
+        original_bytes_total = original_bytes_per_layer * total_layers
+
+        # Tính dung lượng K (Nén toàn bộ)
+        k_bytes = total_layers * total_vectors_per_layer * ((self.head_dim * self.k_bits / 8) + 4)
         
-        # Mức tiêu thụ nguyên thủy với Float16 (16-bit = 2 bytes cho mỗi giá trị)
-        original_bytes = total_vectors * self.head_dim * 2 * 2
+        # Tính dung lượng V (Nén một phần + Nguyên bản một phần)
+        v_compressed_bytes = compressed_layers * total_vectors_per_layer * ((self.head_dim * self.v_bits / 8) + 4)
+        v_boundary_bytes = boundary_layers * total_vectors_per_layer * self.head_dim * 2 # Chỉ V
         
-        # Tính mức tiêu thụ sau khi nén:
-        # - Payload: Dữ liệu bị lượng tử hóa (head_dim * bit_rate / 8 byte)
-        # - Metadata: Chi phí lưu trữ chuẩn L2 (Norm) dùng Float32 (4 bytes cho mỗi vector)
-        k_bytes = total_vectors * ((self.head_dim * self.k_bits / 8) + 4)
-        v_bytes = total_vectors * ((self.head_dim * self.v_bits / 8) + 4)
-        compressed_bytes = k_bytes + v_bytes
+        compressed_bytes_total = k_bytes + v_compressed_bytes + v_boundary_bytes
         
         return {
-            "original_mb": original_bytes / (1024**2),
-            "compressed_mb": compressed_bytes / (1024**2),
-            "ratio": original_bytes / compressed_bytes
+            "original_mb": original_bytes_total / (1024**2),
+            "compressed_mb": compressed_bytes_total / (1024**2),
+            "ratio": original_bytes_total / compressed_bytes_total
         }
