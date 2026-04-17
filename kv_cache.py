@@ -234,3 +234,48 @@ class KVCacheCompressor:
             "compressed_mb": compressed_bytes_total / (1024**2),
             "ratio": original_bytes_total / compressed_bytes_total
         }
+    
+    def decompress_k_layer(self, compressed: CompressedKVCache, layer_idx: int) -> torch.Tensor:
+        """Giải nén toàn bộ ma trận Key cho một layer cụ thể để phục vụ tính toán điểm số."""
+        shape = (1, compressed.num_heads, compressed.seq_len, compressed.head_dim)
+        k_out = torch.zeros(shape, device=self.device)
+        
+        for h in range(compressed.num_heads):
+            k_out[0, h] = self.k_quantizer.dequantize(compressed.k_data[layer_idx][h])
+            
+        return k_out
+
+    def decompress_v_layer_sparse(self, compressed: CompressedKVCache, layer_idx: int, attn_weights: torch.Tensor, threshold: float = 1e-6) -> torch.Tensor:
+        """
+        Chỉ giải nén ma trận Value tại các vị trí mà mô hình đang 'chú ý'.
+        attn_weights shape: [batch, num_heads, q_len, seq_len]
+        """
+        # 1. Tạo mặt nạ Boolean (Lọc các token có điểm > threshold ở bất kỳ query nào)
+        max_attn, _ = attn_weights.max(dim=-2) # Shape: [batch, num_heads, seq_len]
+        mask = max_attn > threshold
+        
+        is_boundary = (layer_idx < compressed.boundary_layers) or (layer_idx >= compressed.num_layers - compressed.boundary_layers)
+        
+        shape = (1, compressed.num_heads, compressed.seq_len, compressed.head_dim)
+        v_out = torch.zeros(shape, device=self.device, dtype=torch.float32)
+        
+        for h in range(compressed.num_heads):
+            head_mask = mask[0, h] # Giả định batch_size = 1 cho tác vụ sinh từ
+            
+            # Bỏ qua hoàn toàn chi phí tính toán nếu head này không chú ý vào token nào
+            if not head_mask.any():
+                continue
+                
+            if is_boundary:
+                # Trích xuất từ tensor gốc (Boundary V)
+                v_head_full = compressed.v_data[layer_idx][h]
+                v_out[0, h, head_mask] = v_head_full[head_mask]
+            else:
+                # --- MÔ PHỎNG LƯỢNG TỬ HÓA THƯA (SPARSE) ---
+                # Trong kernel CUDA/C++, các index 'False' sẽ bị bỏ qua hoàn toàn không tra bảng.
+                # Ở PyTorch, ta giải mã rồi áp dụng mask để đảm bảo tính đúng đắn của toán học.
+                compressed_v_head = compressed.v_data[layer_idx][h]
+                v_head_full = self.v_quantizer.dequantize(compressed_v_head)
+                v_out[0, h, head_mask] = v_head_full[head_mask]
+                
+        return v_out

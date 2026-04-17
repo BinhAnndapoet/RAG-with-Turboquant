@@ -114,6 +114,48 @@ def test_memory_stats():
     
     # So với gốc (16-bit), (3.5 + 2.5) trung bình là 3-bit -> Tiết kiệm ~ 5x
     print_result("Dung lượng bộ nhớ giảm ít nhất 4 lần so với bản gốc", ratio >= 4.0)
+def test_boundary_v_logic():
+    print("\n--- Nhóm 5: Kiểm tra tính năng Boundary V ---")
+    # Sử dụng 8 layer để thấy rõ sự khác biệt giữa "biên" và "giữa"
+    num_layers = 8 
+    num_heads = 2
+    head_dim = 64
+    seq_len = 16
+    boundary_layers = 2
+
+    # Khởi tạo compressor với 2 layer biên ở mỗi đầu
+    compressor = KVCacheCompressor(
+        num_layers=num_layers, 
+        num_heads=num_heads, 
+        head_dim=head_dim, 
+        k_bits=3.5, 
+        v_bits=2.5, 
+        boundary_layers=boundary_layers
+    )
+    
+    k = torch.randn(num_layers, num_heads, seq_len, head_dim)
+    v = torch.randn(num_layers, num_heads, seq_len, head_dim)
+    
+    compressor.calibrate(k, v)
+    compressed = compressor.compress(k, v)
+    k_hat, v_hat = compressor.decompress(compressed)
+    
+    # 1. Kiểm tra ma trận Key (K): Tất cả các layer đều phải bị nén (MSE > 0)
+    k_mse_all = torch.mean((k - k_hat) ** 2).item()
+    print_result("Key (K) luôn bị nén ở MỌI layer (Bảo vệ Attention)", k_mse_all > 0)
+    
+    # 2. Kiểm tra ma trận Value (V) ở vùng biên (Layer 0, 1 và 6, 7): Phải giữ nguyên (MSE == 0)
+    v_boundary_mse = 0.0
+    for l in [0, 1, 6, 7]:
+        v_boundary_mse += torch.mean((v[l] - v_hat[l]) ** 2).item()
+    print_result("Value (V) ở các layer biên được giữ nguyên gốc (MSE == 0)", v_boundary_mse == 0.0)
+    
+    # 3. Kiểm tra ma trận Value (V) ở vùng giữa (Layer 2, 3, 4, 5): Phải bị nén (MSE > 0)
+    v_middle_mse = 0.0
+    for l in range(2, 6):
+        v_middle_mse += torch.mean((v[l] - v_hat[l]) ** 2).item()
+    print_result("Value (V) ở các layer giữa bị nén sâu để tiết kiệm RAM (MSE > 0)", v_middle_mse > 0)
+
 
 if __name__ == "__main__":
     print("BẮT ĐẦU KIỂM THỬ TÍCH HỢP BỘ NHỚ KV CACHE (TRANSFORMER INTEGRATION)")
@@ -121,4 +163,5 @@ if __name__ == "__main__":
     test_round_trip_quality()
     test_attention_score_preservation()
     test_memory_stats()
+    test_boundary_v_logic()  # <-- Thêm dòng này
     print("\n🏁 TẤT CẢ MODULE ĐÃ SẴN SÀNG ĐỂ ĐƯA VÀO PRODUCTION!")
